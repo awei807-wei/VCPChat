@@ -97,7 +97,7 @@ async function initApp() {
         await loadFolders();
 
     } catch (error) {
-        console.error('初始化失败:', error);
+        // 初始化失败
     }
 }
 
@@ -254,8 +254,7 @@ function setupEventListeners() {
                         // 触发 input 事件以更新预览
                         editorTextarea.dispatchEvent(new Event('input'));
                     } catch (err) {
-                        console.error('无法粘贴: ', err);
-                        // 回退到 execCommand
+                        // 无法粘贴，回退到 execCommand
                         document.execCommand('paste');
                     }
                 }
@@ -332,7 +331,9 @@ function showContextMenu(e, items) {
 async function apiFetch(endpoint, options = {}) {
     if (!apiAuthHeader) throw new Error('未认证');
     
-    const response = await fetch(`${serverBaseUrl}admin_api/dailynotes${endpoint}`, {
+    const fullUrl = `${serverBaseUrl}admin_api/dailynotes${endpoint}`;
+    
+    const response = await fetch(fullUrl, {
         ...options,
         headers: {
             'Authorization': apiAuthHeader,
@@ -342,10 +343,38 @@ async function apiFetch(endpoint, options = {}) {
     });
 
     if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err.error || `API 错误: ${response.status}`);
+        // 尝试解析 JSON 错误信息
+        let errorMessage = `API 错误: ${response.status}`;
+        try {
+            const contentType = response.headers.get('content-type');
+            if (contentType && contentType.includes('application/json')) {
+                const err = await response.json();
+                errorMessage = err.error || err.message || errorMessage;
+            } else {
+                // 如果返回的是 HTML 或其他非 JSON 内容
+                const text = await response.text();
+                // 尝试从 HTML 中提取有用信息
+                if (text.includes('<!DOCTYPE') || text.includes('<html')) {
+                    errorMessage = `服务器返回了错误页面 (${response.status})`;
+                } else {
+                    errorMessage = text.substring(0, 100) || errorMessage;
+                }
+            }
+        } catch (parseError) {
+            // 解析错误响应失败
+        }
+        throw new Error(errorMessage);
     }
-    return response.json();
+    
+    // 成功响应也需要检查 content-type
+    const contentType = response.headers.get('content-type');
+    if (contentType && contentType.includes('application/json')) {
+        return response.json();
+    } else {
+        // 如果服务器返回了非 JSON 响应（如 HTML）
+        const text = await response.text();
+        throw new Error('服务器返回了意外的响应格式，请检查 API 端点是否正确');
+    }
 }
 
 // ========== 业务逻辑 ==========
@@ -366,7 +395,7 @@ async function loadFolders() {
             }
         }
     } catch (error) {
-        console.error('加载文件夹失败:', error);
+        // 加载文件夹失败
     }
 }
 
@@ -669,6 +698,7 @@ async function handleDeleteFolder(folderName) {
     if (!confirmed) return;
 
     try {
+        // 注意：这个端点路径与其他 API 不同，需要手动构建完整 URL
         const response = await fetch(`${serverBaseUrl}admin_api/dailynotes/folder/delete`, {
             method: 'POST',
             headers: {
@@ -678,7 +708,17 @@ async function handleDeleteFolder(folderName) {
             body: JSON.stringify({ folderName })
         });
 
-        const data = await response.json();
+        // 检查 Content-Type，避免盲目解析 JSON
+        const contentType = response.headers.get('content-type');
+        let data;
+        
+        if (contentType && contentType.includes('application/json')) {
+            data = await response.json();
+        } else {
+            const text = await response.text();
+            throw new Error('服务器返回了意外的响应格式');
+        }
+
         if (!response.ok) {
             throw new Error(data.error || data.message || '删除失败');
         }
@@ -689,16 +729,19 @@ async function handleDeleteFolder(folderName) {
         }
         await loadFolders();
     } catch (error) {
+        console.error('[handleDeleteFolder] 错误:', error);
         customAlert(error.message, '删除失败');
     }
 }
 
 async function handleDeleteMemo() {
     if (!currentMemo) return;
+    console.log('[handleDeleteMemo] 准备删除日记:', currentMemo);
     const confirmed = await customConfirm(`确定要删除日记 "${currentMemo.file}" 吗？\n此操作不可撤销。`, '⚠️ 删除确认');
     if (!confirmed) return;
 
     try {
+        console.log('[handleDeleteMemo] 开始调用删除 API...');
         await apiFetch('/delete-batch', {
             method: 'POST',
             body: JSON.stringify({
@@ -706,9 +749,12 @@ async function handleDeleteMemo() {
             })
         });
 
+        console.log('[handleDeleteMemo] 删除成功');
         editorOverlay.classList.remove('active');
         await refreshMemoList();
     } catch (error) {
+        console.error('[handleDeleteMemo] 删除失败:', error);
+        console.error('[handleDeleteMemo] 错误堆栈:', error.stack);
         alert('删除失败: ' + error.message);
     }
 }
