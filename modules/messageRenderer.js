@@ -8,6 +8,7 @@ const enhancedRenderDebounceTimers = new WeakMap(); // For debouncing prettify c
 import { avatarColorCache, getDominantAvatarColor } from './renderer/colorUtils.js';
 import { initializeImageHandler, setContentAndProcessImages } from './renderer/imageHandler.js';
 import { processAnimationsInContent, cleanupAnimationsInContent } from './renderer/animation.js';
+import * as visibilityOptimizer from './renderer/visibilityOptimizer.js';
 import { createMessageSkeleton } from './renderer/domBuilder.js';
 import * as streamManager from './renderer/streamManager.js';
 import * as emoticonUrlFixer from './renderer/emoticonUrlFixer.js';
@@ -39,6 +40,7 @@ const HTML_FENCE_CHECK_REGEX = /```\w*\n<!DOCTYPE html>/i;
 const MERMAID_CODE_REGEX = /<code.*?>\s*(flowchart|graph|mermaid)\s+([\s\S]*?)<\/code>/gi;
 const MERMAID_FENCE_REGEX = /```(mermaid|flowchart|graph)\n([\s\S]*?)```/g;
 const CODE_FENCE_REGEX = /```\w*([\s\S]*?)```/g;
+const THOUGHT_CHAIN_REGEX = /\[--- VCP元思考链(?::\s*"([^"]*)")?\s*---\]([\s\S]*?)\[--- 元思考链结束 ---\]/gs;
 
 
 // --- Enhanced Rendering Styles (from UserScript) ---
@@ -105,7 +107,11 @@ async function renderMermaidDiagrams(container) {
         if (code) {
             try {
                 // The placeholder div itself will become the mermaid container
-                placeholder.textContent = decodeURIComponent(code);
+                let decodedCode = decodeURIComponent(code);
+                // 修复 AI 常用的“智能字符”导致的 Mermaid 语法错误
+                decodedCode = decodedCode.replace(/[—–－]/g, '--');
+                
+                placeholder.textContent = decodedCode;
                 placeholder.classList.remove('mermaid-placeholder');
                 placeholder.classList.add('mermaid');
             } catch (e) {
@@ -119,16 +125,18 @@ async function renderMermaidDiagrams(container) {
     const elementsToRender = placeholders.filter(el => el.classList.contains('mermaid'));
 
     if (elementsToRender.length > 0 && typeof mermaid !== 'undefined') {
-        try {
-            // Initialize mermaid if it hasn't been already
-            mermaid.initialize({ startOnLoad: false });
-            await mermaid.run({ nodes: elementsToRender });
-        } catch (error) {
-            console.error("Error rendering Mermaid diagrams:", error);
-            elementsToRender.forEach(el => {
+        // Initialize mermaid if it hasn't been already
+        mermaid.initialize({ startOnLoad: false });
+        
+        // 逐个渲染以防止单个图表错误导致所有图表显示错误
+        for (const el of elementsToRender) {
+            try {
+                await mermaid.run({ nodes: [el] });
+            } catch (error) {
+                console.error("Error rendering Mermaid diagram:", error);
                 const originalCode = el.textContent;
-                el.innerHTML = `<div class="mermaid-error">Mermaid render error: ${error.message}</div><pre>${escapeHtml(originalCode)}</pre>`;
-            });
+                el.innerHTML = `<div class="mermaid-error">Mermaid 渲染错误: ${error.message}</div><pre>${escapeHtml(originalCode)}</pre>`;
+            }
         }
     }
 }
@@ -456,6 +464,39 @@ function transformSpecialBlocks(text) {
         return html;
     });
 
+    // Process VCP Thought Chains
+    processed = processed.replace(THOUGHT_CHAIN_REGEX, (match, theme, rawContent) => {
+        const displayTheme = theme ? theme.trim() : "元思考链";
+        const content = rawContent.trim();
+        const escapedContent = escapeHtml(content);
+
+        let html = `<div class="vcp-thought-chain-bubble collapsible">`;
+        html += `<div class="vcp-thought-chain-header">`;
+        html += `<span class="vcp-thought-chain-icon">🧠</span>`;
+        html += `<span class="vcp-thought-chain-label">${escapeHtml(displayTheme)}</span>`;
+        html += `<span class="vcp-result-toggle-icon"></span>`;
+        html += `</div>`;
+
+        html += `<div class="vcp-thought-chain-collapsible-content">`;
+        
+        let processedContent;
+        if (mainRendererReferences.markedInstance) {
+            try {
+                processedContent = mainRendererReferences.markedInstance.parse(content);
+            } catch (e) {
+                processedContent = `<pre>${escapedContent}</pre>`;
+            }
+        } else {
+            processedContent = `<pre>${escapedContent}</pre>`;
+        }
+
+        html += `<div class="vcp-thought-chain-body">${processedContent}</div>`;
+        html += `</div>`; // End of vcp-thought-chain-collapsible-content
+        html += `</div>`; // End of vcp-thought-chain-bubble
+
+        return html;
+    });
+
     return processed;
 }
 
@@ -504,7 +545,7 @@ function processAndInjectScopedCss(content, scopeId) {
             document.head.appendChild(styleElement);
             styleInjected = true;
             
-            console.log(`[ScopedCSS] Injected scoped styles for ID: #${scopeId}`);
+            console.debug(`[ScopedCSS] Injected scoped styles for ID: #${scopeId}`);
         } catch (error) {
             console.error(`[ScopedCSS] Failed to scope or inject CSS for ID: ${scopeId}`, error);
         }
@@ -752,7 +793,7 @@ function fixEmoticonUrlsInMarkdown(text) {
         if (emoticonUrlFixer && emoticonUrlFixer.fixEmoticonUrl) {
             const fixedUrl = emoticonUrlFixer.fixEmoticonUrl(url);
             if (fixedUrl !== url) {
-                console.log(`[PreprocessFix] Markdown图片: ${url} → ${fixedUrl}`);
+                console.debug(`[PreprocessFix] Markdown图片: ${url} → ${fixedUrl}`);
             }
             return `![${alt}](${fixedUrl})`;
         }
@@ -764,7 +805,7 @@ function fixEmoticonUrlsInMarkdown(text) {
         if (emoticonUrlFixer && emoticonUrlFixer.fixEmoticonUrl) {
             const fixedUrl = emoticonUrlFixer.fixEmoticonUrl(url);
             if (fixedUrl !== url) {
-                console.log(`[PreprocessFix] HTML图片: ${url} → ${fixedUrl}`);
+                console.debug(`[PreprocessFix] HTML图片: ${url} → ${fixedUrl}`);
             }
             return `<img${before}src="${fixedUrl}"${after}>`;
         }
@@ -830,6 +871,8 @@ function removeMessageById(messageId, saveHistory = false) {
         if (contentDiv) {
             cleanupAnimationsInContent(contentDiv);
         }
+        // 停止观察消息可见性
+        visibilityOptimizer.unobserveMessage(item);
         item.remove();
     }
     
@@ -863,6 +906,7 @@ function clearChat() {
             if (contentDiv) {
                 cleanupAnimationsInContent(contentDiv);
             }
+            visibilityOptimizer.unobserveMessage(item);
         });
         
         // 🟢 清理所有注入的 scoped CSS
@@ -888,12 +932,26 @@ function initializeMessageRenderer(refs) {
     // The await will happen inside renderMessage to ensure it's ready before rendering.
     emoticonUrlFixer.initialize(mainRendererReferences.electronAPI);
 
+    // 初始化可见性优化器
+    // 🟢 关键修复：IntersectionObserver 的 root 必须是产生滚动条的那个父容器
+    const scrollContainer = mainRendererReferences.chatMessagesDiv.closest('.chat-messages-container');
+    visibilityOptimizer.initializeVisibilityOptimizer(scrollContainer || mainRendererReferences.chatMessagesDiv);
+
     // --- Event Delegation ---
     mainRendererReferences.chatMessagesDiv.addEventListener('click', (e) => {
-        // 1. Handle collapsible tool results
-        const header = e.target.closest('.vcp-tool-result-header');
-        if (header) {
-            const bubble = header.closest('.vcp-tool-result-bubble.collapsible');
+        // 1. Handle collapsible tool results and thought chains
+        const toolHeader = e.target.closest('.vcp-tool-result-header');
+        if (toolHeader) {
+            const bubble = toolHeader.closest('.vcp-tool-result-bubble.collapsible');
+            if (bubble) {
+                bubble.classList.toggle('expanded');
+            }
+            return;
+        }
+
+        const thoughtHeader = e.target.closest('.vcp-thought-chain-header');
+        if (thoughtHeader) {
+            const bubble = thoughtHeader.closest('.vcp-thought-chain-bubble.collapsible');
             if (bubble) {
                 bubble.classList.toggle('expanded');
             }
@@ -1116,7 +1174,7 @@ async function renderAttachments(message, contentDiv) {
 }
 
 async function renderMessage(message, isInitialLoad = false, appendToDom = true) {
-    console.log('[MessageRenderer renderMessage] Received message:', JSON.parse(JSON.stringify(message))); // Log incoming message
+    // console.debug('[MessageRenderer renderMessage] Received message:', JSON.parse(JSON.stringify(message)));
     const { chatMessagesDiv, electronAPI, markedInstance, uiHelper } = mainRendererReferences;
     const globalSettings = mainRendererReferences.globalSettingsRef.get();
     const currentSelectedItem = mainRendererReferences.currentSelectedItemRef.get();
@@ -1207,6 +1265,8 @@ async function renderMessage(message, isInitialLoad = false, appendToDom = true)
     // 先添加到DOM
     if (appendToDom) {
         chatMessagesDiv.appendChild(messageItem);
+        // 观察新消息的可见性
+        visibilityOptimizer.observeMessage(messageItem);
     }
 
     if (message.isThinking) {
@@ -1320,7 +1380,7 @@ async function renderMessage(message, isInitialLoad = false, appendToDom = true)
     if ((message.role === 'user' || message.role === 'assistant') && avatarImg && senderNameDiv) {
         const applyColorToElements = (colorStr) => {
             if (colorStr) {
-                console.log(`[DEBUG] Applying color ${colorStr} to message item ${messageItem.dataset.messageId}`);
+                console.debug(`[DEBUG] Applying color ${colorStr} to message item ${messageItem.dataset.messageId}`);
                 messageItem.style.setProperty('--dynamic-avatar-color', colorStr);
                 
                 // 后备方案：直接应用到avatarImg
@@ -1335,14 +1395,14 @@ async function renderMessage(message, isInitialLoad = false, appendToDom = true)
                     senderNameDiv.style.color = colorStr;
                 }
             } else {
-                console.log(`[DEBUG] No color to apply, using default`);
+                console.debug(`[DEBUG] No color to apply, using default`);
                 messageItem.style.removeProperty('--dynamic-avatar-color');
             }
         };
 
         // 如果启用了主题颜色模式，不应用任何自定义颜色，让CSS主题接管
         if (useThemeColors) {
-            console.log(`[DEBUG] Using theme colors for message ${messageItem.dataset.messageId}`);
+            console.debug(`[DEBUG] Using theme colors for message ${messageItem.dataset.messageId}`);
             messageItem.style.removeProperty('--dynamic-avatar-color');
             if (avatarImg) {
                 avatarImg.style.removeProperty('border-color');
@@ -1352,7 +1412,7 @@ async function renderMessage(message, isInitialLoad = false, appendToDom = true)
             }
         } else if (customBorderColor && avatarImg) {
             // 优先应用自定义颜色（如果启用且未启用主题颜色）
-            console.log(`[DEBUG] Applying custom border color ${customBorderColor} to avatar`);
+            console.debug(`[DEBUG] Applying custom border color ${customBorderColor} to avatar`);
             avatarImg.style.borderColor = customBorderColor;
             avatarImg.style.borderWidth = '2px';
             avatarImg.style.borderStyle = 'solid';
@@ -1414,7 +1474,7 @@ async function renderMessage(message, isInitialLoad = false, appendToDom = true)
         
         // 应用自定义名称文字颜色
         if (customNameColor && senderNameDiv) {
-            console.log(`[DEBUG] Applying custom name color ${customNameColor} to sender name`);
+            console.debug(`[DEBUG] Applying custom name color ${customNameColor} to sender name`);
             senderNameDiv.style.color = customNameColor;
         }
         
@@ -1434,7 +1494,7 @@ async function renderMessage(message, isInitialLoad = false, appendToDom = true)
             
             // 通过动态注入<style>标签应用会话CSS
             if (chatCss && chatCss.trim()) {
-                console.log(`[DEBUG] Applying chat CSS to message ${message.id}:`, chatCss);
+                console.debug(`[DEBUG] Applying chat CSS to message ${message.id}:`, chatCss);
                 
                 // 为此消息创建唯一的scope ID
                 const chatScopeId = `vcp-chat-${message.id}`;
@@ -1544,7 +1604,7 @@ async function finalizeStreamedMessage(messageId, finishReason, context) {
  * @param {string} agentId - The ID of the agent sending the message.
  */
 async function renderFullMessage(messageId, fullContent, agentName, agentId) {
-    console.log(`[MessageRenderer renderFullMessage] Rendering full message for ID: ${messageId}`);
+    console.debug(`[MessageRenderer renderFullMessage] Rendering full message for ID: ${messageId}`);
     const { chatMessagesDiv, electronAPI, uiHelper, markedInstance } = mainRendererReferences;
     const currentChatHistoryArray = mainRendererReferences.currentChatHistoryRef.get();
     const currentSelectedItem = mainRendererReferences.currentSelectedItemRef.get();
@@ -1578,7 +1638,7 @@ async function renderFullMessage(messageId, fullContent, agentName, agentId) {
 
     const messageItem = chatMessagesDiv.querySelector(`.message-item[data-message-id="${messageId}"]`);
     if (!messageItem) {
-        console.log(`[renderFullMessage] No DOM element for ${messageId}. History updated, UI skipped.`);
+        console.debug(`[renderFullMessage] No DOM element for ${messageId}. History updated, UI skipped.`);
         return; // No UI to update, but history is now consistent.
     }
 
@@ -1717,7 +1777,7 @@ async function renderHistory(history, options = {}) {
         return renderHistoryLegacy(history);
     }
 
-    console.log(`[MessageRenderer] 开始分批渲染 ${history.length} 条消息，首批 ${initialBatch} 条，后续每批 ${batchSize} 条`);
+    console.debug(`[MessageRenderer] 开始分批渲染 ${history.length} 条消息，首批 ${initialBatch} 条，后续每批 ${batchSize} 条`);
 
     // 分离最新的消息和历史消息
     const latestMessages = history.slice(-initialBatch);
@@ -1725,7 +1785,7 @@ async function renderHistory(history, options = {}) {
 
     // 第一阶段：立即渲染最新的消息
     await renderMessageBatch(latestMessages, true);
-    console.log(`[MessageRenderer] 首批 ${latestMessages.length} 条最新消息已渲染`);
+    console.debug(`[MessageRenderer] 首批 ${latestMessages.length} 条最新消息已渲染`);
 
     // 第二阶段：分批渲染历史消息（从旧到新）
     if (olderMessages.length > 0) {
@@ -1734,7 +1794,7 @@ async function renderHistory(history, options = {}) {
 
     // 最终滚动到底部
     mainRendererReferences.uiHelper.scrollToBottom();
-    console.log(`[MessageRenderer] 所有 ${history.length} 条消息渲染完成`);
+    console.debug(`[MessageRenderer] 所有 ${history.length} 条消息渲染完成`);
 }
 
 /**
@@ -1771,6 +1831,9 @@ async function renderMessageBatch(messages, scrollToBottom = false) {
             
             // Step 2: Now that they are in the DOM, run the deferred processing for each.
             messageElements.forEach(el => {
+                // 观察批量渲染的消息
+                visibilityOptimizer.observeMessage(el);
+                
                 if (typeof el._vcp_process === 'function') {
                     el._vcp_process();
                     delete el._vcp_process; // Clean up to avoid memory leaks
@@ -1830,6 +1893,9 @@ async function renderOlderMessagesInBatches(olderMessages, batchSize, batchDelay
                 }
 
                 elementsForProcessing.forEach(el => {
+                    // 观察批量渲染的历史消息
+                    visibilityOptimizer.observeMessage(el);
+
                     if (typeof el._vcp_process === 'function') {
                         el._vcp_process();
                         delete el._vcp_process;
@@ -1881,6 +1947,9 @@ async function renderHistoryLegacy(history) {
 
             // Step 2: Run the deferred processing for each element now that it's attached.
             allMessageElements.forEach(el => {
+                // 观察历史消息
+                visibilityOptimizer.observeMessage(el);
+
                 if (typeof el._vcp_process === 'function') {
                     el._vcp_process();
                     delete el._vcp_process; // Clean up

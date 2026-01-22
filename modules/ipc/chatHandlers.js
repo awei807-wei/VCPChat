@@ -2,6 +2,7 @@
 const { ipcMain, dialog, BrowserWindow } = require('electron');
 const fs = require('fs-extra');
 const path = require('path');
+const contextSanitizer = require('../contextSanitizer');
 
 /**
  * Initializes chat and topic related IPC handlers.
@@ -711,6 +712,33 @@ ipcMain.handle('get-original-message-content', async (event, itemId, itemType, t
                 console.error('[Agent Bubble Theme] Failed to inject bubble theme info:', e);
             }
             // --- End of Injection ---
+
+            // --- VCP Thought Chain Stripping ---
+            try {
+                // 默认不注入元思考链，除非明确开启
+                if (settings.enableThoughtChainInjection !== true) {
+                    messages = messages.map(msg => {
+                        if (typeof msg.content === 'string') {
+                            return { ...msg, content: contextSanitizer.stripThoughtChains(msg.content) };
+                        } else if (Array.isArray(msg.content)) {
+                            return {
+                                ...msg,
+                                content: msg.content.map(part => {
+                                    if (part.type === 'text' && typeof part.text === 'string') {
+                                        return { ...part, text: contextSanitizer.stripThoughtChains(part.text) };
+                                    }
+                                    return part;
+                                })
+                            };
+                        }
+                        return msg;
+                    });
+                    console.log(`[ThoughtChain] Thought chains stripped from context`);
+                }
+            } catch (e) {
+                console.error('[ThoughtChain] Failed to strip thought chains:', e);
+            }
+
             // --- Context Sanitizer Integration ---
             try {
                 if (settings.enableContextSanitizer === true) {
@@ -722,8 +750,11 @@ ipcMain.handle('get-original-message-content', async (event, itemId, itemType, t
                     const nonSystemMessages = messages.filter(m => m.role !== 'system');
                     
                     // 对非系统消息应用净化
-                    const contextSanitizer = require('../contextSanitizer');
-                    const sanitizedNonSystemMessages = contextSanitizer.sanitizeMessages(nonSystemMessages, sanitizerDepth);
+                    const sanitizedNonSystemMessages = contextSanitizer.sanitizeMessages(
+                        nonSystemMessages,
+                        sanitizerDepth,
+                        settings.enableThoughtChainInjection === true
+                    );
                     
                     // 重新组合消息数组（保持系统消息在最前面）
                     messages = [...systemMessages, ...sanitizedNonSystemMessages];

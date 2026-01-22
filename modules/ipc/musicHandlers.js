@@ -245,8 +245,9 @@ function initialize(options) {
         });
 
         // --- New handlers for WASAPI and device selection ---
-        ipcMain.handle('music-get-devices', async () => {
-            return await audioEngineApi('/devices', 'GET');
+        ipcMain.handle('music-get-devices', async (event, options = {}) => {
+            const refresh = options.refresh ? '?refresh=true' : '';
+            return await audioEngineApi(`/devices${refresh}`, 'GET');
         });
 
         ipcMain.handle('music-configure-output', (event, { device_id, exclusive }) => {
@@ -261,6 +262,14 @@ function initialize(options) {
         // --- New handler for Upsampling ---
         ipcMain.handle('music-configure-upsampling', (event, { target_samplerate }) => {
             return audioEngineApi('/configure_upsampling', 'POST', { target_samplerate });
+        });
+
+        ipcMain.handle('music-set-eq-type', (event, { type }) => {
+            return audioEngineApi('/set_eq_type', 'POST', { type });
+        });
+
+        ipcMain.handle('music-configure-optimizations', (event, data) => {
+            return audioEngineApi('/configure_optimizations', 'POST', data);
         });
  
          ipcMain.on('open-music-folder', async (event) => {
