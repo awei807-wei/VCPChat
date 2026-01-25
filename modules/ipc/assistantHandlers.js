@@ -32,9 +32,13 @@ function processSelectedText(selectionData) {
     
     // 检测是否在截图（常见截图工具的进程名）
     const foregroundApp = getForegroundAppName();
-    const screenshotApps = ['SnippingTool', 'Snipaste', 'ShareX', 'QQ', 'WeChat'];
-    if (screenshotApps.some(app => foregroundApp.includes(app))) {
-        console.log('[Assistant] Screenshot tool active, suspending for 3s');
+    // 在 Linux 下，QQ 经常作为聊天窗口使用，不应列入截图避让名单
+    const screenshotApps = process.platform === 'win32'
+        ? ['SnippingTool', 'Snipaste', 'ShareX', 'QQ', 'WeChat']
+        : ['SnippingTool', 'Snipaste', 'ShareX', 'flameshot', 'spectacle'];
+
+    if (screenshotApps.some(app => foregroundApp.toLowerCase().includes(app.toLowerCase()))) {
+        console.log(`[Assistant] Screenshot tool (${foregroundApp}) active, suspending for 3s`);
         suspendUntil = Date.now() + 3000;
         return;
     }
@@ -96,19 +100,29 @@ function processSelectedText(selectionData) {
     });
 }
 
-// 获取前台应用名称（Windows）
+// 获取前台应用名称（跨平台）
 function getForegroundAppName() {
-    if (process.platform !== 'win32') return '';
     try {
         const { execSync } = require('child_process');
-        const result = execSync(
-            'powershell "Get-Process | Where-Object {$_.MainWindowHandle -ne 0} | Select-Object -First 1 ProcessName"',
-            { encoding: 'utf8' }
-        );
-        return result.trim();
+        if (process.platform === 'win32') {
+            const result = execSync(
+                'powershell "Get-Process | Where-Object {$_.MainWindowHandle -ne 0} | Select-Object -First 1 ProcessName"',
+                { encoding: 'utf8' }
+            );
+            return result.trim();
+        } else if (process.platform === 'linux') {
+            // Linux (X11/Wayland) 窗口感知
+            try {
+                const result = execSync('xdotool getwindowfocus getwindowname', { encoding: 'utf8' });
+                return result.trim();
+            } catch (e) {
+                return '';
+            }
+        }
     } catch {
         return '';
     }
+    return '';
 }
 
 
@@ -159,20 +173,66 @@ function hideAssistantBarAndStopListener() {
     }
 }
 
+let linuxSelectionProcess = null;
+let linuxClipboardProcess = null;
+
+function startLinuxSelectionListener() {
+    const { spawn, execSync } = require('child_process');
+    
+    // 彻底清理旧进程，避免残留
+    try {
+        execSync('pkill -9 wl-paste || true');
+    } catch (e) {}
+
+    let lastText = '';
+    let lastTime = 0;
+
+    const handleEvent = (isPrimary) => {
+        const now = Date.now();
+        // 增加 100ms 防抖，避免双通道同时触发导致的重复处理
+        if (now - lastTime < 100) return;
+        
+        const text = isPrimary ? clipboard.readText('selection') : clipboard.readText();
+        if (text && text !== lastText) {
+            lastText = text;
+            lastTime = now;
+            processSelectedText({ text, method: 4 });
+        }
+    };
+
+    try {
+        // 监听 Primary Selection (划词)
+        linuxSelectionProcess = spawn('wl-paste', ['--primary', '--watch', 'echo', 'changed']);
+        linuxSelectionProcess.stdout.on('data', () => handleEvent(true));
+
+        // 监听 Standard Clipboard (Ctrl+C)
+        linuxClipboardProcess = spawn('wl-paste', ['--watch', 'echo', 'changed']);
+        linuxClipboardProcess.stdout.on('data', () => handleEvent(false));
+
+        selectionListenerActive = true;
+        console.log('[Assistant] Linux dual-channel listener started with debounce');
+    } catch (e) {
+        console.error('[Assistant] Failed to start Linux listener:', e);
+    }
+}
+
 function startSelectionListener() {
-    if (selectionListenerActive || !SelectionHook) {
+    if (selectionListenerActive) return;
+
+    if (process.platform === 'linux') {
+        startLinuxSelectionListener();
         return;
     }
+
+    if (!SelectionHook) return;
+
     try {
         selectionHookInstance = new SelectionHook();
         selectionHookInstance.on('text-selection', processSelectedText);
         selectionHookInstance.on('error', (error) => console.error('Error in SelectionHook:', error));
 
-        // 🔥 启动时初始化剪贴板状态
         lastClipboardContent = clipboard.readText();
         
-        
-        // 每500ms检测剪贴板冲突
         clipChecker = setInterval(() => {
             if (!selectionListenerActive) {
                 clearInterval(clipChecker);
@@ -185,21 +245,32 @@ function startSelectionListener() {
         if (selectionHookInstance.start({ debug: false })) {
             selectionListenerActive = true;
             registerSuspendHotkey();
-            console.log('[Assistant] Listener started with smart suspension');
+            console.log('[Assistant] Windows listener started');
         } else {
             console.error('[Assistant] Failed to start selection-hook listener.');
             selectionHookInstance = null;
         }
     } catch (e) {
-        console.error('[Assistant] Failed to instantiate or start selection-hook listener:', e);
+        console.error('[Assistant] Failed to start selection-hook listener:', e);
         selectionHookInstance = null;
     }
 }
 
 function stopSelectionListener() {
-    if (!selectionListenerActive || !selectionHookInstance) {
+    if (!selectionListenerActive) return;
+
+    if (process.platform === 'linux') {
+        if (linuxSelectionProcess) linuxSelectionProcess.kill();
+        if (linuxClipboardProcess) linuxClipboardProcess.kill();
+        linuxSelectionProcess = null;
+        linuxClipboardProcess = null;
+        selectionListenerActive = false;
+        console.log('[Assistant] Linux listener stopped.');
         return;
     }
+
+    if (!selectionHookInstance) return;
+
     try {
         selectionHookInstance.stop();
         globalShortcut.unregister('CommandOrControl+Shift+P');
@@ -207,9 +278,9 @@ function stopSelectionListener() {
             clearInterval(clipChecker);
             clipChecker = null;
         }
-        console.log('[Assistant] selection-hook listener stopped.');
+        console.log('[Assistant] Windows listener stopped.');
     } catch (e) {
-        console.error('[Assistant] Failed to stop selection-hook listener:', e);
+        console.error('[Assistant] Failed to stop listener:', e);
     } finally {
         selectionHookInstance = null;
         selectionListenerActive = false;
@@ -285,18 +356,18 @@ async function initialize(options) {
     SETTINGS_FILE = options.SETTINGS_FILE;
 
     // Asynchronously load selection-hook at startup
-    if (process.platform === 'win32') {
+    if (process.platform === 'win32' || process.platform === 'linux') {
         try {
-            // Dynamic import returns a promise
-            const selectionHookModule = await import('selection-hook');
-            SelectionHook = selectionHookModule.default || selectionHookModule;
-            console.log('selection-hook loaded asynchronously.');
+            // 🔥 关键：加载 Vendor 化的本地模块
+            const vendorPath = path.join(__dirname, '../../lib/selection-hook/index.js');
+            SelectionHook = require(vendorPath);
+            console.log(`selection-hook (Vendor) loaded asynchronously on ${process.platform}.`);
         } catch (error) {
             console.error('Failed to load selection-hook asynchronously:', error);
-            SelectionHook = null; // Ensure it's null on failure
+            SelectionHook = null;
         }
     } else {
-        console.log('selection-hook is only available on Windows, text selection feature will be disabled.');
+        console.log(`selection-hook is not supported on ${process.platform}.`);
     }
 
     createAssistantBarWindow();
