@@ -290,6 +290,15 @@ function showContextMenu(event, messageItem, message) {
 
                 try {
                     const agentConfig = await electronAPI.getAgentConfig(agentId);
+                    
+                    // 检查是否获取配置失败
+                    if (agentConfig && agentConfig.error) {
+                        console.error('[MessageContextMenu] Failed to get agent config for TTS:', agentConfig.error);
+                        uiHelper.showToastNotification('获取Agent配置失败，无法朗读。', 'error');
+                        closeContextMenu();
+                        return;
+                    }
+                    
                     if (agentConfig && agentConfig.ttsVoicePrimary) {
                         const contentDiv = messageItem.querySelector('.md-content');
                         let textToRead = '';
@@ -391,7 +400,7 @@ function showContextMenu(event, messageItem, message) {
                 textForConfirm = '[消息内容无法预览]';
             }
             
-            if (confirm(`确定要删除此消息吗？\n"${textForConfirm.substring(0, 50)}${textForConfirm.length > 50 ? '...' : ''}"`)) {
+            if (await uiHelper.showConfirmDialog(`确定要删除此消息吗？\n"${textForConfirm.substring(0, 50)}${textForConfirm.length > 50 ? '...' : ''}"`, '删除确认', '删除', '取消', true)) {
                 contextMenuDependencies.removeMessageById(message.id, true); // Pass true to save history
             }
             closeContextMenu();
@@ -715,6 +724,21 @@ async function handleRegenerateResponse(originalAssistantMessage) {
 
     try {
         const agentConfig = await electronAPI.getAgentConfig(currentSelectedItemVal.id);
+        
+        // 检查是否获取配置失败
+        if (agentConfig && agentConfig.error) {
+            console.error('[MessageContextMenu] Failed to get agent config for regeneration:', agentConfig.error);
+            uiHelper.showToastNotification('获取Agent配置失败，无法重新生成消息。', 'error');
+            // 移除思考中消息
+            const messages = contextMenuDependencies.chatContainer.querySelectorAll('.message-item');
+            if (messages.length > 0) {
+                const lastMessage = messages[messages.length - 1];
+                if (lastMessage.classList.contains('thinking')) {
+                    lastMessage.remove();
+                }
+            }
+            return;
+        }
         
         const messagesForVCP = await Promise.all(historyForRegeneration.map(async (msg, index) => {
             let vcpImageAttachmentsPayload = [];

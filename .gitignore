@@ -15,4 +15,25 @@ node_modules/
 **/.DS_Store
 
 # Rust build artifacts
-rust_audio_engine/target/
+**/target/
+**/Cargo.lock
+rust_audio_engine/.cargo/
+
+# Reports and logs
+**/reports/
+
+# 临时忽略的文件（本地修改，不提交）
+.npmrc
+modules/ipc/chatHandlers.js
+modules/itemListManager.js
+modules/settingsManager.js
+package-lock.json
+package.json
+styles/themes.css
+
+# LibreHardwareMonitor 官方二进制由开发者本地自行准备，不进入仓库
+vendor/LibreHardwareMonitor/*
+!vendor/LibreHardwareMonitor/README.md
+
+# 本地知识库目录不进入开源仓库
+Desktopmodules/helloagents/

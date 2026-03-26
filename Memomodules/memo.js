@@ -11,6 +11,7 @@ let currentFolder = '';
 let allMemos = [];
 let currentMemo = null; // 当前正在编辑的日记 { folder, file, content }
 let searchScope = 'folder'; // 'folder' or 'global'
+let searchAbortController = null; // 搜索请求控制器
 let isBatchMode = false;
 let selectedMemos = new Set(); // Set of "folder:::name" strings
 let hiddenFolders = new Set(); // Set of hidden folder names
@@ -60,6 +61,11 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 绑定事件
     setupEventListeners();
+
+    // 初始化工作台
+    if (window.DiaryWorkbench) {
+        window.DiaryWorkbench.init();
+    }
 });
 
 async function initApp() {
@@ -97,11 +103,22 @@ async function initApp() {
         await loadFolders();
 
     } catch (error) {
-        // 初始化失败
+        console.error('初始化失败:', error);
     }
 }
 
 function setupEventListeners() {
+    // 文件夹搜索
+    const folderSearchInput = document.getElementById('folder-search-input');
+    folderSearchInput.oninput = () => {
+        const term = folderSearchInput.value.trim().toLowerCase();
+        const items = folderListEl.querySelectorAll('.folder-item');
+        items.forEach(item => {
+            const name = item.querySelector('span')?.textContent?.toLowerCase() || '';
+            item.style.display = name.includes(term) ? '' : 'none';
+        });
+    };
+
     // 刷新文件夹
     const refreshBtn = document.getElementById('refresh-folders-btn');
     refreshBtn.onclick = async () => {
@@ -137,12 +154,16 @@ function setupEventListeners() {
         if (term) searchMemos(term);
     };
 
-    // 搜索
+    // 搜索 (增加防抖保护)
+    const debouncedSearch = debounce((term) => {
+        searchMemos(term);
+    }, 300);
+
     searchInput.onkeydown = (e) => {
         if (e.key === 'Enter') {
             const term = searchInput.value.trim();
             if (term) {
-                searchMemos(term);
+                debouncedSearch(term);
             } else if (currentFolder) {
                 loadMemos(currentFolder);
             }
@@ -174,6 +195,15 @@ function setupEventListeners() {
 
     document.getElementById('batch-delete-btn').onclick = handleBatchDelete;
     document.getElementById('batch-move-select').onchange = handleBatchMove;
+    document.getElementById('batch-workbench-btn').onclick = () => {
+        const selected = allMemos.filter(m => {
+            const memoId = `${m.folderName || currentFolder}:::${m.name}`;
+            return selectedMemos.has(memoId);
+        });
+        if (window.DiaryWorkbench) {
+            window.DiaryWorkbench.open(selected);
+        }
+    };
 
     // 悬浮条清空
     document.getElementById('batch-bar-clear').onclick = () => {
@@ -203,6 +233,87 @@ function setupEventListeners() {
     };
     document.getElementById('hidden-modal-ok-btn').onclick = () => {
         document.getElementById('hidden-folders-modal').style.display = 'none';
+    };
+
+    // 联想弹窗事件
+    const kInput = document.getElementById('input-assoc-k');
+    const boostInput = document.getElementById('input-assoc-boost');
+    const kValueLabel = document.getElementById('label-k-value');
+    const boostValueLabel = document.getElementById('label-boost-value');
+
+    if (kInput) kInput.oninput = () => kValueLabel.textContent = kInput.value;
+    if (boostInput) boostInput.oninput = () => boostValueLabel.textContent = boostInput.value;
+
+    document.getElementById('close-assoc-config-btn').onclick = () => {
+        document.getElementById('assoc-config-modal').style.display = 'none';
+    };
+
+    document.getElementById('start-assoc-btn').onclick = startAssociation;
+
+    // 联想视图事件
+    document.getElementById('close-graph-btn').onclick = closeNeuralGraph;
+    document.getElementById('close-panel-btn').onclick = () => {
+        document.getElementById('node-detail-panel').classList.add('hidden');
+        graphState.selectedNode = null;
+    };
+
+    document.getElementById('reset-graph-btn').onclick = () => {
+        graphState.transform = { x: 0, y: 0, scale: 1 };
+    };
+
+    document.getElementById('zoom-in-btn').onclick = () => {
+        graphState.transform.scale *= 1.2;
+    };
+
+    document.getElementById('zoom-out-btn').onclick = () => {
+        graphState.transform.scale /= 1.2;
+    };
+
+    document.getElementById('node-edit-btn').onclick = () => {
+        if (graphState.selectedNode) {
+            const node = graphState.selectedNode;
+            // 不再关闭图谱，直接打开编辑器（编辑器将通过 z-index 覆盖在上方）
+            openMemo({ name: node.name, folderName: node.folder });
+        }
+    };
+    
+    document.getElementById('node-relink-btn').onclick = () => {
+        if (graphState.selectedNode) {
+            const node = graphState.selectedNode;
+            openAssociationConfig({
+                name: node.name,
+                folderName: node.folder,
+                path: node.path,
+                id: node.id // 传递 ID 以便追加
+            }, true);
+        }
+    };
+
+    document.getElementById('node-delete-btn').onclick = async () => {
+        if (graphState.selectedNode) {
+            const node = graphState.selectedNode;
+            const confirmed = await customConfirm(`确定要删除日记 "${node.name}" 吗？`, '⚠️ 删除确认');
+            if (confirmed) {
+                try {
+                    await apiFetch('/delete-batch', {
+                        method: 'POST',
+                        body: JSON.stringify({
+                            notesToDelete: [{ folder: node.folder, file: node.name }]
+                        })
+                    });
+                    // 从图谱中移除节点及其连接
+                    graphState.nodes = graphState.nodes.filter(n => n.id !== node.id);
+                    graphState.links = graphState.links.filter(l => l.source.id !== node.id && l.target.id !== node.id);
+                    
+                    // 清除状态并关闭详情面板
+                    graphState.selectedNode = null;
+                    graphState.hoveredNode = null;
+                    document.getElementById('node-detail-panel').classList.add('hidden');
+                } catch (e) {
+                    alert('删除失败: ' + e.message);
+                }
+            }
+        }
     };
 
     // 编辑器控制
@@ -256,7 +367,8 @@ function setupEventListeners() {
                         // 触发 input 事件以更新预览
                         editorTextarea.dispatchEvent(new Event('input'));
                     } catch (err) {
-                        // 无法粘贴，回退到 execCommand
+                        console.error('无法粘贴: ', err);
+                        // 回退到 execCommand
                         document.execCommand('paste');
                     }
                 }
@@ -270,13 +382,17 @@ function setupEventListeners() {
             // 优先级：确认弹窗 > 编辑器 > 新建弹窗
             const confirmModal = document.getElementById('custom-confirm-modal');
             const alertModal = document.getElementById('custom-alert-modal');
-            
+
             if (confirmModal && confirmModal.style.display === 'flex') {
                 document.getElementById('confirm-cancel-btn').click();
             } else if (alertModal && alertModal.style.display === 'flex') {
                 document.getElementById('alert-ok-btn').click();
             } else if (document.getElementById('hidden-folders-modal').style.display === 'flex') {
                 document.getElementById('close-hidden-modal-btn').click();
+            } else if (document.getElementById('assoc-config-modal').style.display === 'flex') {
+                document.getElementById('close-assoc-config-btn').click();
+            } else if (document.getElementById('neural-graph-overlay').style.display === 'flex') {
+                document.getElementById('close-graph-btn').click();
             } else if (editorOverlay.classList.contains('active')) {
                 document.getElementById('close-editor-btn').click();
             } else if (createModal.style.display === 'flex') {
@@ -297,7 +413,7 @@ function setupEventListeners() {
 function showContextMenu(e, items) {
     e.preventDefault();
     contextMenuEl.innerHTML = '';
-    
+
     items.forEach(item => {
         const menuItem = document.createElement('div');
         menuItem.className = `context-menu-item ${item.className || ''}`;
@@ -314,17 +430,17 @@ function showContextMenu(e, items) {
     });
 
     contextMenuEl.style.display = 'block';
-    
+
     // 调整位置防止溢出
     let x = e.clientX;
     let y = e.clientY;
-    
+
     const menuWidth = contextMenuEl.offsetWidth || 150;
     const menuHeight = contextMenuEl.offsetHeight || 100;
-    
+
     if (x + menuWidth > window.innerWidth) x -= menuWidth;
     if (y + menuHeight > window.innerHeight) y -= menuHeight;
-    
+
     contextMenuEl.style.left = `${x}px`;
     contextMenuEl.style.top = `${y}px`;
 }
@@ -332,51 +448,23 @@ function showContextMenu(e, items) {
 // ========== API 调用 ==========
 async function apiFetch(endpoint, options = {}) {
     if (!apiAuthHeader) throw new Error('未认证');
-    
-    const fullUrl = `${serverBaseUrl}admin_api/dailynotes${endpoint}`;
-    
-    const response = await fetch(fullUrl, {
+
+    const response = await fetch(`${serverBaseUrl}admin_api/dailynotes${endpoint}`, {
         ...options,
         headers: {
             'Authorization': apiAuthHeader,
             'Content-Type': 'application/json',
-            ...options.headers
+            ...(options.headers || {})
         }
     });
 
     if (!response.ok) {
-        // 尝试解析 JSON 错误信息
-        let errorMessage = `API 错误: ${response.status}`;
-        try {
-            const contentType = response.headers.get('content-type');
-            if (contentType && contentType.includes('application/json')) {
-                const err = await response.json();
-                errorMessage = err.error || err.message || errorMessage;
-            } else {
-                // 如果返回的是 HTML 或其他非 JSON 内容
-                const text = await response.text();
-                // 尝试从 HTML 中提取有用信息
-                if (text.includes('<!DOCTYPE') || text.includes('<html')) {
-                    errorMessage = `服务器返回了错误页面 (${response.status})`;
-                } else {
-                    errorMessage = text.substring(0, 100) || errorMessage;
-                }
-            }
-        } catch (parseError) {
-            // 解析错误响应失败
-        }
-        throw new Error(errorMessage);
+        const err = await response.json().catch(() => ({}));
+        let msg = err.error || `API 错误: ${response.status}`;
+        if (err.details) msg += ` - ${err.details}`;
+        throw new Error(msg);
     }
-    
-    // 成功响应也需要检查 content-type
-    const contentType = response.headers.get('content-type');
-    if (contentType && contentType.includes('application/json')) {
-        return response.json();
-    } else {
-        // 如果服务器返回了非 JSON 响应（如 HTML）
-        const text = await response.text();
-        throw new Error('服务器返回了意外的响应格式，请检查 API 端点是否正确');
-    }
+    return response.json();
 }
 
 // ========== 业务逻辑 ==========
@@ -397,7 +485,7 @@ async function loadFolders() {
             }
         }
     } catch (error) {
-        // 加载文件夹失败
+        console.error('加载文件夹失败:', error);
     }
 }
 
@@ -429,7 +517,7 @@ function renderFolders(folders) {
         item.setAttribute('draggable', 'true');
         item.innerHTML = `
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-            <span>${folder}</span>
+            <span>${escapeHtml(folder)}</span>
         `;
         item.onclick = () => selectFolder(folder);
 
@@ -459,10 +547,10 @@ function renderFolders(folders) {
                 // 重新排序
                 const fromIndex = folderOrder.indexOf(draggedFolder);
                 const toIndex = folderOrder.indexOf(folder);
-                
+
                 folderOrder.splice(fromIndex, 1);
                 folderOrder.splice(toIndex, 0, draggedFolder);
-                
+
                 renderFolders(folders); // 重新渲染
                 await saveMemoConfig(); // 持久化
             }
@@ -473,7 +561,7 @@ function renderFolders(folders) {
             item.classList.remove('dragging');
             draggedFolder = null;
         };
-        
+
         // 文件夹右键菜单
         item.oncontextmenu = (e) => {
             showContextMenu(e, [
@@ -506,7 +594,7 @@ function renderFolders(folders) {
 async function selectFolder(folderName) {
     currentFolder = folderName;
     currentFolderNameEl.textContent = folderName;
-    
+
     // 更新 UI 选中状态
     document.querySelectorAll('.folder-item').forEach(el => {
         el.classList.toggle('active', el.querySelector('span').textContent === folderName);
@@ -519,8 +607,10 @@ async function loadMemos(folderName) {
     try {
         memoGridEl.innerHTML = '<div style="padding: 20px;">加载中...</div>';
         const data = await apiFetch(`/folder/${encodeURIComponent(folderName)}`);
-        allMemos = data.notes;
-        renderMemos(data.notes);
+        const memos = data.memos || data.notes || [];
+        console.log('[MemoCenter] Raw data from folder API:', memos);
+        allMemos = memos; // 更新全局变量，修复批量管理模式显示为空的问题
+        renderMemos(memos);
     } catch (error) {
         memoGridEl.innerHTML = `<div style="padding: 20px; color: var(--danger-color);">加载失败: ${error.message}</div>`;
     }
@@ -539,21 +629,32 @@ function renderMemos(memos) {
         const memoId = `${memoFolder}:::${memo.name}`;
         const isSelected = selectedMemos.has(memoId);
         card.className = `memo-card glass glass-hover ${isBatchMode ? 'selectable' : ''} ${isSelected ? 'selected' : ''}`;
-        
+
         const dateStr = new Date(memo.lastModified).toLocaleString();
-        
+
         card.innerHTML = `
             <div>
-                <h3>${memo.name}</h3>
-                <p class="preview">${memo.preview || '无预览内容'}</p>
+                <h3>${escapeHtml(memo.name)}</h3>
+                <p class="preview">${escapeHtml(memo.preview || '无预览内容')}</p>
             </div>
             <div class="meta">
                 <span>📅 ${dateStr}</span>
-                ${memo.folderName && memo.folderName !== currentFolder ? `<span style="opacity:0.6; font-size:0.7rem;">📁 ${memo.folderName}</span>` : ''}
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    ${memo.folderName && memo.folderName !== currentFolder ? `<span style="opacity:0.6; font-size:0.7rem;">📁 ${escapeHtml(memo.folderName)}</span>` : ''}
+                    <button class="association-btn" title="记忆联想">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .52 8.125A5.002 5.002 0 0 0 14 18a5 5 0 0 0 5-5A3 3 0 0 0 12 5Z"/><path d="M12 18v-2a2 2 0 0 0-2-2H8"/><path d="M16 8a2 2 0 0 0-2 2v2"/></svg>
+                    联想
+                </button>
+                </div>
             </div>
         `;
-        
-        card.onclick = () => {
+
+        card.onclick = (e) => {
+            if (e.target.closest('.association-btn')) {
+                e.stopPropagation();
+                openAssociationConfig(memo);
+                return;
+            }
             if (isBatchMode) {
                 if (selectedMemos.has(memoId)) {
                     selectedMemos.delete(memoId);
@@ -573,15 +674,15 @@ function renderMemos(memos) {
 function updateBatchUI() {
     const count = selectedMemos.size;
     document.getElementById('selected-count').textContent = `已选 ${count} 项`;
-    
+
     const floatingBar = document.getElementById('batch-floating-bar');
     const barCount = document.getElementById('batch-bar-count');
     const barItems = document.getElementById('batch-bar-items');
-    
+
     if (count > 0 && isBatchMode) {
         floatingBar.style.display = 'flex';
         barCount.textContent = `已选择 ${count} 项`;
-        
+
         // 渲染选中项列表
         barItems.innerHTML = '';
         selectedMemos.forEach(memoId => {
@@ -589,8 +690,8 @@ function updateBatchUI() {
             const item = document.createElement('div');
             item.className = 'batch-item-tag';
             item.innerHTML = `
-                <div class="item-name" title="${name}">${name}</div>
-                <div class="item-folder">📁 ${folder}</div>
+                <div class="item-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
+                <div class="item-folder">📁 ${escapeHtml(folder)}</div>
                 <div class="batch-item-remove" title="移除">×</div>
             `;
             item.querySelector('.batch-item-remove').onclick = (e) => {
@@ -609,7 +710,7 @@ function updateBatchUI() {
 async function openMemo(memo) {
     try {
         const memoFolder = memo.folderName || currentFolder;
-        
+
         // 跳转逻辑：如果点击的是非当前文件夹的日记，更新当前文件夹状态
         if (memoFolder !== currentFolder) {
             currentFolder = memoFolder;
@@ -631,7 +732,7 @@ async function openMemo(memo) {
         editorPreview.innerHTML = '';
 
         const data = await apiFetch(`/note/${encodeURIComponent(memoFolder)}/${encodeURIComponent(memo.name)}`);
-        
+
         currentMemo = {
             folder: memoFolder,
             file: memo.name,
@@ -684,7 +785,7 @@ async function handleSaveMemo() {
 
         currentMemo.content = newContent;
         editorStatus.textContent = '保存成功 ' + new Date().toLocaleTimeString();
-        
+
         // 刷新列表预览
         await refreshMemoList();
     } catch (error) {
@@ -700,7 +801,6 @@ async function handleDeleteFolder(folderName) {
     if (!confirmed) return;
 
     try {
-        // 注意：这个端点路径与其他 API 不同，需要手动构建完整 URL
         const response = await fetch(`${serverBaseUrl}admin_api/dailynotes/folder/delete`, {
             method: 'POST',
             headers: {
@@ -710,17 +810,7 @@ async function handleDeleteFolder(folderName) {
             body: JSON.stringify({ folderName })
         });
 
-        // 检查 Content-Type，避免盲目解析 JSON
-        const contentType = response.headers.get('content-type');
-        let data;
-        
-        if (contentType && contentType.includes('application/json')) {
-            data = await response.json();
-        } else {
-            const text = await response.text();
-            throw new Error('服务器返回了意外的响应格式');
-        }
-
+        const data = await response.json();
         if (!response.ok) {
             throw new Error(data.error || data.message || '删除失败');
         }
@@ -731,19 +821,16 @@ async function handleDeleteFolder(folderName) {
         }
         await loadFolders();
     } catch (error) {
-        console.error('[handleDeleteFolder] 错误:', error);
         customAlert(error.message, '删除失败');
     }
 }
 
 async function handleDeleteMemo() {
     if (!currentMemo) return;
-    console.log('[handleDeleteMemo] 准备删除日记:', currentMemo);
     const confirmed = await customConfirm(`确定要删除日记 "${currentMemo.file}" 吗？\n此操作不可撤销。`, '⚠️ 删除确认');
     if (!confirmed) return;
 
     try {
-        console.log('[handleDeleteMemo] 开始调用删除 API...');
         await apiFetch('/delete-batch', {
             method: 'POST',
             body: JSON.stringify({
@@ -751,12 +838,9 @@ async function handleDeleteMemo() {
             })
         });
 
-        console.log('[handleDeleteMemo] 删除成功');
         editorOverlay.classList.remove('active');
         await refreshMemoList();
     } catch (error) {
-        console.error('[handleDeleteMemo] 删除失败:', error);
-        console.error('[handleDeleteMemo] 错误堆栈:', error.stack);
         alert('删除失败: ' + error.message);
     }
 }
@@ -781,18 +865,18 @@ async function handleCreateMemo() {
 
         // 构造 TOOL_REQUEST
         const toolRequest = `<<<[TOOL_REQUEST]>>>
-maid:「始」${maid}「末」, 
+maid:「始」${maid}「末」,
 tool_name:「始」DailyNote「末」,
-command:「始」create「末」,  
+command:「始」create「末」,
 Date:「始」${date}「末」,
-Content:「始」${content}「末」 
+Content:「始」${content}「末」
 <<<[END_TOOL_REQUEST]>>>`;
 
         const res = await fetch(`${serverBaseUrl}v1/human/tool`, {
             method: 'POST',
-            headers: { 
-                'Content-Type': 'text/plain;charset=UTF-8', 
-                'Authorization': `Bearer ${settings.vcpApiKey}` 
+            headers: {
+                'Content-Type': 'text/plain;charset=UTF-8',
+                'Authorization': `Bearer ${settings.vcpApiKey}`
             },
             body: toolRequest
         });
@@ -802,7 +886,7 @@ Content:「始」${content}「末」
         // 成功后处理
         createModal.style.display = 'none';
         newMemoContentInput.value = '';
-        
+
         // 延迟刷新，给后端一点处理时间
         setTimeout(async () => {
             await loadFolders();
@@ -818,17 +902,23 @@ Content:「始」${content}「末」
 }
 
 async function searchMemos(term) {
+    // 如果有正在进行的搜索，立即取消它
+    if (searchAbortController) {
+        searchAbortController.abort();
+    }
+    searchAbortController = new AbortController();
+
     try {
         memoGridEl.innerHTML = '<div style="padding: 20px;">搜索中...</div>';
         let url = `/search?term=${encodeURIComponent(term)}`;
-        
+
         // 根据搜索范围决定是否添加 folder 参数
         if (searchScope === 'folder' && currentFolder) {
             url += `&folder=${encodeURIComponent(currentFolder)}`;
         }
 
-        const data = await apiFetch(url);
-        
+        const data = await apiFetch(url, { signal: searchAbortController.signal });
+
         // 过滤掉来自 MusicDiary 和隐藏文件夹的搜索结果
         const filteredNotes = data.notes.filter(note =>
             note.folderName !== 'MusicDiary' && !hiddenFolders.has(note.folderName)
@@ -839,7 +929,16 @@ async function searchMemos(term) {
         currentFolderNameEl.textContent = `${scopeText}: ${term}`;
         renderMemos(filteredNotes);
     } catch (error) {
+        if (error.name === 'AbortError') {
+            console.log('搜索请求已取消:', term);
+            return;
+        }
         memoGridEl.innerHTML = `<div style="padding: 20px; color: var(--danger-color);">搜索失败: ${error.message}</div>`;
+    } finally {
+        // 如果当前 controller 还是自己，则清空
+        if (searchAbortController && !searchAbortController.signal.aborted) {
+            // 这里不直接置空，因为可能已经有新的搜索发起了
+        }
     }
 }
 
@@ -908,7 +1007,7 @@ async function handleHideFolder(folderName) {
 
     hiddenFolders.add(folderName);
     await saveMemoConfig();
-    
+
     if (currentFolder === folderName) {
         currentFolder = '';
         memoGridEl.innerHTML = '';
@@ -943,7 +1042,7 @@ function openHiddenFoldersModal() {
             item.innerHTML = `
                 <div style="display: flex; align-items: center; gap: 10px;">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 18px; height: 18px;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-                    <span>${folder}</span>
+                    <span>${escapeHtml(folder)}</span>
                 </div>
                 <button class="glass-btn" style="padding: 4px 10px; font-size: 0.8rem;">取消隐藏</button>
             `;
@@ -1042,6 +1141,16 @@ function customAlert(message, title = '提示') {
 }
 
 // ========== 工具函数 ==========
+function escapeHtml(str) {
+    if (typeof str !== 'string') return str;
+    return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
 function debounce(func, wait) {
     let timeout;
     return function(...args) {

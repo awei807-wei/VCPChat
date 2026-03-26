@@ -26,6 +26,7 @@ if (!ALLOWED_DIRECTORIES.includes(CANVAS_DIRECTORY)) {
 const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE) || 20971520; // 20MB default
 const MAX_DIRECTORY_ITEMS = parseInt(process.env.MAX_DIRECTORY_ITEMS) || 1000;
 const MAX_SEARCH_RESULTS = parseInt(process.env.MAX_SEARCH_RESULTS) || 100;
+const DEFAULT_DOWNLOAD_DIR = (process.env.DEFAULT_DOWNLOAD_DIR || '').trim();
 const DEBUG_MODE = process.env.DEBUG_MODE === 'true';
 const ENABLE_RECURSIVE_OPERATIONS = process.env.ENABLE_RECURSIVE_OPERATIONS !== 'false';
 const ENABLE_HIDDEN_FILES = process.env.ENABLE_HIDDEN_FILES === 'true';
@@ -37,6 +38,90 @@ function debugLog(message, data = null) {
     console.error(`[DEBUG ${timestamp}] ${message}`);
     if (data) console.error(JSON.stringify(data, null, 2));
   }
+}
+
+/**
+ * CRLF line ending detection and handling utility
+ * @param {string} content - Original file content
+ * @returns {Object} Object containing normalization and restoration methods
+ */
+function createLineEndingHelper(content) {
+  const crlfCount = (content.match(/\r\n/g) || []).length;
+
+  // Improved LF counting: [^\r]\n handles most cases, plus check file start
+  let lfCount = (content.match(/[^\r]\n/g) || []).length;
+  if (content.startsWith('\n')) {
+    lfCount += 1;
+  }
+
+  const crCount = (content.match(/\r(?!\n)/g) || []).length;
+
+  let lineEnding = '\n';
+  if (crlfCount > lfCount && crlfCount > crCount) {
+    lineEnding = '\r\n';
+  } else if (crCount > lfCount && crCount > crlfCount) {
+    lineEnding = '\r';
+  }
+
+  const hasCRLF = crlfCount > 0;
+
+  if (DEBUG_MODE) {
+    console.error(`[CRLF Detect] CRLF=${crlfCount}, LF=${lfCount}, CR=${crCount}, using=${JSON.stringify(lineEnding)}`);
+  }
+
+  return {
+    normalize: (str) => str.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
+
+    denormalize: (str) => {
+      if (lineEnding === '\r\n') {
+        return str.replace(/\n/g, '\r\n');
+      } else if (lineEnding === '\r') {
+        return str.replace(/\n/g, '\r');
+      }
+      return str;
+    },
+
+    includes: (cnt, search) => {
+      const normContent = cnt.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const normSearch = search.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      return normContent.includes(normSearch);
+    },
+
+    safeReplace: (originalContent, searchStr, replaceStr) => {
+      const normContent = originalContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const normSearch = searchStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const normReplace = replaceStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+      if (!normContent.includes(normSearch)) {
+        return {
+          success: false,
+          error: 'Search string not found after CRLF normalization'
+        };
+      }
+
+      const normResult = normContent.replace(normSearch, normReplace);
+
+      let result = normResult;
+      if (lineEnding === '\r\n') {
+        result = normResult.replace(/\n/g, '\r\n');
+      } else if (lineEnding === '\r') {
+        result = normResult.replace(/\n/g, '\r');
+      }
+
+      return { success: true, result };
+    },
+
+    getDebugInfo: () => ({
+      crlfCount,
+      lfCount,
+      crCount,
+      chosen: lineEnding === '\r\n' ? 'CRLF' : (lineEnding === '\r' ? 'CR' : 'LF'),
+      totalSize: content.length
+    }),
+
+    hasCRLF,
+    lineEnding: JSON.stringify(lineEnding)
+  };
 }
 
 function isPathAllowed(targetPath, operationType = 'generic') {
@@ -65,7 +150,7 @@ function isPathAllowed(targetPath, operationType = 'generic') {
     debugLog(`Path is outside allowed directories, but operation is a read-only bypass. Access granted.`, { targetPath, operationType });
     return true;
   }
-  
+
   // 3. 对于所有其他情况（例如，在沙箱外的写/删除操作），一律拒绝。
   debugLog(`Access denied. Path is outside allowed directories and operation is not a read-only bypass.`, { targetPath, operationType });
   return false;
@@ -99,12 +184,11 @@ function getUniqueFilePath(filePath) {
 }
 
 function applyDiffLogic(originalContent, diffContent) {
+  const helper = createLineEndingHelper(originalContent);
   const diffBlocks = diffContent.split('<<<<<<< SEARCH').slice(1);
   if (diffBlocks.length === 0) {
     throw new Error('Invalid diff format: No SEARCH blocks found.');
   }
-
-  let modifiedContent = originalContent;
 
   // Per user feedback, only process the first SEARCH block.
   const block = diffBlocks[0];
@@ -119,15 +203,13 @@ function applyDiffLogic(originalContent, diffContent) {
   // This logic correctly ignores line numbers and only takes content after '-------'
   const searchContent = searchPart.substring(searchPart.indexOf('-------') + '-------'.length).trim();
   const replaceContent = replacePart.trim();
-  
-  if (modifiedContent.includes(searchContent)) {
-    // .replace() will only replace the first occurrence found in the file.
-    modifiedContent = modifiedContent.replace(searchContent, replaceContent);
-  } else {
-    throw new Error(`Diff application failed: SEARCH content not found in the original file. Content not found: "${searchContent}"`);
+
+  const replaceResult = helper.safeReplace(originalContent, searchContent, replaceContent);
+  if (!replaceResult.success) {
+    throw new Error(`Diff application failed: ${replaceResult.error}. Content not found: "${searchContent}"`);
   }
 
-  return modifiedContent;
+  return replaceResult.result;
 }
 
 // Helper function to run validation and attach results
@@ -141,7 +223,7 @@ async function runValidationAndAttachResults(result, filePath, fileContent) {
   }
   return result;
 }
- 
+
 // File operation functions
 async function webReadFile(fileUrl) {
   try {
@@ -177,10 +259,10 @@ async function webReadFile(fileUrl) {
       result.data.originalUrl = fileUrl;
       // Prepend a message to reflect the web origin
       if (Array.isArray(result.data.content)) {
-          result.data.content.unshift({ type: 'text', text: `已从网络地址读取文件 '${result.data.fileName}' 并保存到本地。` });
+        result.data.content.unshift({ type: 'text', text: `已从网络地址读取文件 '${result.data.fileName}' 并保存到本地。` });
       }
     }
-    
+
     return result;
 
   } catch (error) {
@@ -245,49 +327,49 @@ async function readFile(filePath, encoding = 'utf8') {
       content = sheetContent;
       isExtracted = true;
     } else if (imageExtensions.includes(extension)) {
-        const mimeType = `image/${extension.slice(1).replace('jpg', 'jpeg')}`;
-        content = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
-        isExtracted = true;
+      const mimeType = `image/${extension.slice(1).replace('jpg', 'jpeg')}`;
+      content = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+      isExtracted = true;
     } else if (audioExtensions.includes(extension)) {
-        const mimeType = `audio/${extension.slice(1).replace('mp3', 'mpeg')}`;
-        content = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
-        isExtracted = true;
+      const mimeType = `audio/${extension.slice(1).replace('mp3', 'mpeg')}`;
+      content = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+      isExtracted = true;
     } else if (videoExtensions.includes(extension)) {
-        const mimeType = `video/${extension.slice(1)}`;
-        content = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
-        isExtracted = true;
+      const mimeType = `video/${extension.slice(1)}`;
+      content = `data:${mimeType};base64,${fileBuffer.toString('base64')}`;
+      isExtracted = true;
     } else {
       // Fallback for plain text files
       content = fileBuffer.toString(encoding);
     }
 
     const returnData = {
-        size: stats.size,
-        sizeFormatted: formatFileSize(stats.size),
-        lastModified: stats.mtime.toISOString(),
-        encoding: isExtracted ? 'utf8' : encoding,
-        isExtracted: isExtracted,
-        fileName: path.basename(filePath)
+      size: stats.size,
+      sizeFormatted: formatFileSize(stats.size),
+      lastModified: stats.mtime.toISOString(),
+      encoding: isExtracted ? 'utf8' : encoding,
+      isExtracted: isExtracted,
+      fileName: path.basename(filePath)
     };
 
     const headerText = `已读取文件 '${returnData.fileName}' (${returnData.sizeFormatted})。`;
 
     if (isExtracted && content.startsWith('data:image')) {
-        returnData.content = [
-            { type: 'text', text: headerText },
-            { type: 'image_url', image_url: { url: content } }
-        ];
+      returnData.content = [
+        { type: 'text', text: headerText },
+        { type: 'image_url', image_url: { url: content } }
+      ];
     } else if (isExtracted && (content.startsWith('data:audio') || content.startsWith('data:video'))) {
-        returnData.content = [
-            { type: 'text', text: headerText },
-            { type: 'image_url', image_url: { url: content } }
-        ];
+      returnData.content = [
+        { type: 'text', text: headerText },
+        { type: 'image_url', image_url: { url: content } }
+      ];
     } else {
-        // For text-based files
-        returnData.content = [
-            { type: 'text', text: headerText },
-            { type: 'text', text: content }
-        ];
+      // For text-based files
+      returnData.content = [
+        { type: 'text', text: headerText },
+        { type: 'text', text: content }
+      ];
     }
 
     return {
@@ -319,11 +401,11 @@ async function writeFile(filePath, content, encoding = 'utf8') {
 
     await fs.writeFile(newPath, content, encoding);
     const stats = await fs.stat(newPath);
- 
+
     const message = renamed
       ? `已存在同名文件 "${path.basename(filePath)}"，已为您创建为 "${path.basename(newPath)}"`
       : '文件写入成功';
- 
+
     let result = {
       success: true,
       data: {
@@ -371,7 +453,7 @@ async function appendFile(filePath, content, encoding = 'utf8') {
 
     await fs.appendFile(filePath, content, encoding);
     const stats = await fs.stat(filePath);
- 
+
     let result = {
       success: true,
       data: {
@@ -421,7 +503,7 @@ async function editFile(filePath, content, encoding = 'utf8') {
 
     await fs.writeFile(filePath, content, encoding);
     const stats = await fs.stat(filePath);
- 
+
     let result = {
       success: true,
       data: {
@@ -478,7 +560,13 @@ async function listDirectory(dirPath, showHidden = ENABLE_HIDDEN_FILES) {
       }
     }
 
-    const message = `Directory listing of ${dirPath} (${result.length} items${items.length > MAX_DIRECTORY_ITEMS ? ', truncated' : ''})`;
+    // Convert result to Markdown table
+    let mdTable = `| 文件名称 | 类型 | 大小 | 修改时间 | 隐藏文件 |\n|---|---|---|---|---|\n`;
+    for (const item of result) {
+      mdTable += `| ${item.name} | ${item.type === 'directory' ? '📁 目录' : '📄 文件'} | ${item.sizeFormatted || '-'} | ${item.lastModified} | ${item.isHidden ? '是' : '否'} |\n`;
+    }
+
+    const message = `目录内容: \`${dirPath}\` (${result.length} 个项目${items.length > MAX_DIRECTORY_ITEMS ? '，已截断显示' : ''})`;
     return {
       success: true,
       data: {
@@ -488,8 +576,7 @@ async function listDirectory(dirPath, showHidden = ENABLE_HIDDEN_FILES) {
         truncated: items.length > MAX_DIRECTORY_ITEMS,
         message: message,
         content: [
-            { type: 'text', text: message },
-            { type: 'text', text: JSON.stringify(result, null, 2) }
+          { type: 'text', text: `### ${message}\n\n${mdTable}` }
         ]
       },
     };
@@ -513,30 +600,41 @@ async function getFileInfo(filePath) {
     const stats = await fs.stat(filePath);
 
     const fileData = {
-        path: filePath,
-        name: path.basename(filePath),
-        directory: path.dirname(filePath),
-        extension: path.extname(filePath),
-        type: stats.isDirectory() ? 'directory' : 'file',
-        size: stats.size,
-        sizeFormatted: formatFileSize(stats.size),
-        lastModified: stats.mtime.toISOString(),
-        lastAccessed: stats.atime.toISOString(),
-        created: stats.birthtime.toISOString(),
-        permissions: stats.mode,
-        isDirectory: stats.isDirectory(),
-        isFile: stats.isFile(),
-        isSymbolicLink: stats.isSymbolicLink(),
+      path: filePath,
+      name: path.basename(filePath),
+      directory: path.dirname(filePath),
+      extension: path.extname(filePath),
+      type: stats.isDirectory() ? 'directory' : 'file',
+      size: stats.size,
+      sizeFormatted: formatFileSize(stats.size),
+      lastModified: stats.mtime.toISOString(),
+      lastAccessed: stats.atime.toISOString(),
+      created: stats.birthtime.toISOString(),
+      permissions: stats.mode,
+      isDirectory: stats.isDirectory(),
+      isFile: stats.isFile(),
+      isSymbolicLink: stats.isSymbolicLink(),
     };
+
+    // Convert to Markdown list
+    const mdList = `### 文件详细信息: \`${fileData.name}\`\n
+- **完整路径**: \`${fileData.path}\`
+- **所在目录**: \`${fileData.directory}\`
+- **类型**: ${fileData.isFile ? '📄 文件' : fileData.isDirectory ? '📁 目录' : '🔗 符号链接'}
+- **扩展名**: ${fileData.extension || '(无)'}
+- **大小**: ${fileData.sizeFormatted} (${fileData.size} 字节)
+- **创建时间**: ${fileData.created}
+- **修改时间**: ${fileData.lastModified}
+- **访问时间**: ${fileData.lastAccessed}
+- **权限掩码**: ${fileData.permissions}`;
 
     return {
       success: true,
       data: {
         ...fileData,
-        message: `File info for ${filePath}`,
+        message: `获取 ${filePath} 的信息成功。`,
         content: [
-            { type: 'text', text: `File info for ${filePath}:` },
-            { type: 'text', text: JSON.stringify(fileData, null, 2) }
+          { type: 'text', text: mdList }
         ]
       },
     };
@@ -788,7 +886,12 @@ async function searchFiles(searchPath, pattern, options = {}) {
       }
     }
 
-    const message = `Search results for "${pattern}" in ${searchPath} (${results.length} results${files.length >= MAX_SEARCH_RESULTS ? ', truncated' : ''})`;
+    let mdTable = `| 相对路径 | 类型 | 大小 | 修改时间 |\n|---|---|---|---|\n`;
+    for (const item of results) {
+      mdTable += `| ${item.relativePath} | ${item.type === 'directory' ? '📁' : '📄'} | ${item.sizeFormatted || '-'} | ${item.lastModified} |\n`;
+    }
+
+    const message = `搜索结果: \`${pattern}\` 在 \`${searchPath}\` 中 (${results.length} 个结果${files.length >= MAX_SEARCH_RESULTS ? '，已截断' : ''})`;
     return {
       success: true,
       data: {
@@ -800,8 +903,7 @@ async function searchFiles(searchPath, pattern, options = {}) {
         options: options,
         message: message,
         content: [
-            { type: 'text', text: message },
-            { type: 'text', text: JSON.stringify(results, null, 2) }
+          { type: 'text', text: `### ${message}\n\n${mdTable}` }
         ]
       },
     };
@@ -814,17 +916,31 @@ async function searchFiles(searchPath, pattern, options = {}) {
   }
 }
 
-async function downloadFile(url) {
+async function downloadFile(url, downloadDir, customFileName) {
   try {
     // Automatically parse filename from URL
     const parsedUrl = new URL(url);
-    const fileName = path.basename(parsedUrl.pathname);
-    
-    // Construct the full destination path in the designated AppData/file directory
-    const baseDir = path.join(__dirname, '..', '..', '..', 'AppData', 'file');
+    const urlFileName = path.basename(parsedUrl.pathname);
+
+    // Determine the actual file name: use customFileName if provided, otherwise use URL-derived name
+    const fileName = customFileName ? customFileName : urlFileName;
+
+    // Determine the base directory with priority:
+    // 1. Caller-specified downloadDir parameter
+    // 2. DEFAULT_DOWNLOAD_DIR from .env configuration
+    // 3. Fallback to AppData/file directory
+    let baseDir;
+    if (downloadDir && downloadDir.trim()) {
+      baseDir = downloadDir.trim();
+    } else if (DEFAULT_DOWNLOAD_DIR) {
+      baseDir = DEFAULT_DOWNLOAD_DIR;
+    } else {
+      baseDir = path.join(__dirname, '..', '..', '..', 'AppData', 'file');
+    }
+
     const destinationPath = path.join(baseDir, fileName);
 
-    debugLog('Initiating asynchronous file download', { url, destinationPath });
+    debugLog('Initiating asynchronous file download', { url, destinationPath, downloadDir, customFileName });
 
     if (!isPathAllowed(destinationPath, 'WriteFile')) {
       throw new Error(`Access denied: Path '${destinationPath}' is not in allowed directories`);
@@ -859,7 +975,9 @@ async function downloadFile(url) {
     });
 
     // Immediately return a success message to the AI
-    const message = `文件下载任务已在后台启动。将从URL自动解析文件名并保存到: ${newPath}`;
+    const message = customFileName
+      ? `文件下载任务已在后台启动。使用自定义文件名 "${fileName}"，保存到: ${newPath}`
+      : `文件下载任务已在后台启动。将从URL自动解析文件名并保存到: ${newPath}`;
     return {
       success: true,
       data: {
@@ -908,14 +1026,27 @@ async function listAllowedDirectories() {
       }
       allProjects[dir] = subItems;
     }
+    let mdStr = `### 允许访问的目录白名单\n\n`;
+    for (const [dir, items] of Object.entries(allProjects)) {
+      mdStr += `#### \`${dir}\`\n`;
+      if (items.length === 0) {
+        mdStr += `*(空目录)*\n\n`;
+      } else {
+        mdStr += `| 名称 | 类型 |\n|---|---|\n`;
+        for (const item of items) {
+          mdStr += `| ${item.name} | ${item.type === 'directory' ? '📁 目录' : '📄 文件'} |\n`;
+        }
+        mdStr += `\n`;
+      }
+    }
+
     return {
       success: true,
       data: {
         allowedRoots: allProjects,
-        message: 'Allowed directories listed',
+        message: '获取允许访问的目录列表成功',
         content: [
-            { type: 'text', text: 'Allowed directories and their contents:' },
-            { type: 'text', text: JSON.stringify(allProjects, null, 2) }
+          { type: 'text', text: mdStr }
         ]
       }
     };
@@ -975,7 +1106,7 @@ async function updateHistory(filePath, searchString, replaceString, encoding = '
 
     // 1. Read the file content
     const fileContent = await fs.readFile(filePath, encoding);
-    
+
     // 2. Parse the JSON content
     const history = JSON.parse(fileContent);
 
@@ -988,12 +1119,17 @@ async function updateHistory(filePath, searchString, replaceString, encoding = '
     // 3. Iterate through the history to find and replace the content
     for (let i = 0; i < history.length; i++) {
       const entry = history[i];
-      if (entry.role === 'assistant' && typeof entry.content === 'string' && entry.content.includes(searchString)) {
-        // Replace only the first occurrence found
-        entry.content = entry.content.replace(searchString, replaceString);
-        updateApplied = true;
-        debugLog(`Found and replaced content in message at index ${i}.`);
-        break; // Stop after the first successful replacement
+      if (entry.role === 'assistant' && typeof entry.content === 'string') {
+        const helper = createLineEndingHelper(entry.content);
+        if (helper.includes(entry.content, searchString)) {
+          const replaceResult = helper.safeReplace(entry.content, searchString, replaceString);
+          if (replaceResult.success) {
+            entry.content = replaceResult.result;
+            updateApplied = true;
+            debugLog(`Found and replaced content in message at index ${i}.`);
+            break; // Stop after the first successful replacement
+          }
+        }
       }
     }
 
@@ -1021,7 +1157,7 @@ async function updateHistory(filePath, searchString, replaceString, encoding = '
     };
   }
 }
- 
+
 async function applyDiff(parameters) {
   try {
     const { filePath, diffContent, searchString, replaceString, encoding } = parameters;
@@ -1031,10 +1167,27 @@ async function applyDiff(parameters) {
       throw new Error(`Failed to read file for applying diff: ${readResult.error}`);
     }
     // We can only apply diff to string content.
-    if (typeof readResult.data.content !== 'string') {
-        throw new Error('ApplyDiff can only be used on plain text files.');
+    if (readResult.data.isExtracted) {
+      throw new Error('ApplyDiff cannot be used on extracted content (PDF, DOCX, Excel, Images, etc.). It only works on plain text files.');
     }
-    const originalContent = readResult.data.content;
+
+    let originalContent;
+    if (typeof readResult.data.content === 'string') {
+      originalContent = readResult.data.content;
+    } else if (Array.isArray(readResult.data.content)) {
+      // In multimodal format, the actual file content is the last text part
+      const textParts = readResult.data.content.filter(part => part.type === 'text');
+      if (textParts.length >= 2) {
+        // Skip the header message (e.g., "已读取文件...") and take the actual content
+        originalContent = textParts[textParts.length - 1].text;
+      } else if (textParts.length === 1) {
+        originalContent = textParts[0].text;
+      }
+    }
+
+    if (typeof originalContent !== 'string') {
+      throw new Error('ApplyDiff can only be used on plain text files.');
+    }
     let newContent;
 
     if (diffContent) {
@@ -1042,16 +1195,17 @@ async function applyDiff(parameters) {
       newContent = applyDiffLogic(originalContent, diffContent);
     } else if (searchString !== undefined && replaceString !== undefined) {
       // Handle the legacy format with searchString and replaceString
-      if (!originalContent.includes(searchString)) {
+      const helper = createLineEndingHelper(originalContent);
+      const replaceResult = helper.safeReplace(originalContent, searchString, replaceString);
+      if (!replaceResult.success) {
         // Make error more specific for debugging
-        throw new Error(`Diff application failed: searchString content not found in the original file. Content not found: "${searchString}"`);
+        throw new Error(`Diff application failed: ${replaceResult.error}. Content not found: "${searchString}"`);
       }
-      // Per user feedback, use .replace() to only replace the first occurrence.
-      newContent = originalContent.replace(searchString, replaceString);
+      newContent = replaceResult.result;
     } else {
       throw new Error('ApplyDiff requires either "diffContent" or both "searchString" and "replaceString" parameters.');
     }
-    
+
     const editResult = await editFile(filePath, newContent, encoding);
     if (editResult.success) {
       editResult.data.message = '文件编辑已经提交等待用户确认';
@@ -1063,7 +1217,7 @@ async function applyDiff(parameters) {
     return { success: false, error: `Failed to apply diff: ${error.message}` };
   }
 }
- 
+
 // Batch processing for legacy format with robust content and action aggregation
 async function processBatchRequest(request) {
   debugLog('Processing legacy batch request with robust aggregation', { request });
@@ -1147,7 +1301,7 @@ async function processBatchRequest(request) {
           }
           break;
         case 'DownloadFile':
-          result = await downloadFile(parameters.url);
+          result = await downloadFile(parameters.url, parameters.downloadDir, parameters.fileName);
           break;
         case 'CreateCanvas':
           result = await createCanvas(parameters.fileName, parameters.content, parameters.encoding);
@@ -1177,7 +1331,7 @@ async function processBatchRequest(request) {
       // For non-read operations, generate a summary message instead of pushing to content
       const contentCommands = ['ReadFile', 'WebReadFile', 'ListDirectory', 'FileInfo', 'SearchFiles', 'ListAllowedDirectories'];
       if (!contentCommands.includes(command)) {
-         summaryMessages.push(result.data.message);
+        summaryMessages.push(result.data.message);
       }
     } else {
       failureCount++;
@@ -1189,8 +1343,8 @@ async function processBatchRequest(request) {
 
   // Prepend summary of all non-read operations to the aggregated content
   if (summaryMessages.length > 0) {
-      const summaryText = `Batch Operations Summary:\n- ${summaryMessages.join('\n- ')}`;
-      aggregatedContent.unshift({ type: 'text', text: summaryText });
+    const summaryText = `Batch Operations Summary:\n- ${summaryMessages.join('\n- ')}`;
+    aggregatedContent.unshift({ type: 'text', text: summaryText });
   }
 
   // If there's any content (from reads or summaries), return the aggregated multimodal response.
@@ -1257,11 +1411,11 @@ async function processRequest(request) {
     case 'SearchFiles':
       return await searchFiles(parameters.searchPath, parameters.pattern, parameters.options);
     case 'DownloadFile':
-      return await downloadFile(parameters.url);
+      return await downloadFile(parameters.url, parameters.downloadDir, parameters.fileName);
     case 'CreateCanvas':
-        return await createCanvas(parameters.fileName, parameters.content, parameters.encoding);
+      return await createCanvas(parameters.fileName, parameters.content, parameters.encoding);
     case 'UpdateHistory':
-        return await updateHistory(parameters.filePath, parameters.searchString, parameters.replaceString, parameters.encoding);
+      return await updateHistory(parameters.filePath, parameters.searchString, parameters.replaceString, parameters.encoding);
     case 'ApplyDiff':
       return await applyDiff(parameters);
     default:
@@ -1301,14 +1455,14 @@ process.stdin.on('data', async data => {
 function convertToVCPFormat(response) {
   if (response.success) {
     const data = response.data || {};
-    
+
     // Special action handling
     if (data._specialAction) {
       debugLog('Converting response with special action', {
         action: data._specialAction,
         payload: data.payload
       });
-      
+
       return {
         status: 'success',
         _specialAction: data._specialAction,
@@ -1321,7 +1475,7 @@ function convertToVCPFormat(response) {
     }
 
     let contentArray = [];
-    
+
     // 1. Handle content if present
     if (data.content) {
       if (Array.isArray(data.content)) {
@@ -1330,7 +1484,7 @@ function convertToVCPFormat(response) {
         contentArray.push({ type: 'text', text: data.content });
       }
     }
-    
+
     // 2. Handle message if present
     if (data.message) {
       // Check if message is already represented in content
@@ -1343,11 +1497,10 @@ function convertToVCPFormat(response) {
     // 3. Handle details/items/results if content is still empty
     if (contentArray.length === 0) {
       if (data.items) {
-        contentArray.push({ type: 'text', text: `Items found (${data.totalItems || data.items.length}):
-${JSON.stringify(data.items, null, 2)}` });
+        // If items somehow slipped through without content wrapper
+        contentArray.push({ type: 'text', text: `### 发现的项目 (${data.totalItems || data.items.length}):\n${data.items.map(i => `- ${i.name} (${i.type})`).join('\n')}` });
       } else if (data.results) {
-        contentArray.push({ type: 'text', text: `Search results (${data.totalResults || data.results.length}):
-${JSON.stringify(data.results, null, 2)}` });
+        contentArray.push({ type: 'text', text: `### 搜索结果 (${data.totalResults || data.results.length}):\n${data.results.map(r => `- ${r.relativePath}`).join('\n')}` });
       } else if (data.details) {
         contentArray.push({ type: 'text', text: typeof data.details === 'string' ? data.details : JSON.stringify(data.details, null, 2) });
       }
@@ -1355,18 +1508,17 @@ ${JSON.stringify(data.results, null, 2)}` });
 
     // 4. Add validation results if present
     if (data.validation && Array.isArray(data.validation)) {
-      contentArray.push({ type: 'text', text: `Code Validation Results:
-${JSON.stringify(data.validation, null, 2)}` });
+      contentArray.push({ type: 'text', text: `### 代码验证结果:\n${data.validation.map(v => `- [行 ${v.line || '?'}:列 ${v.column || '?'}] **${v.ruleId || '错误'}**: ${v.message}`).join('\n')}` });
     }
 
     // 5. Fallback for other structured data
     if (contentArray.length === 0) {
-      const { content, message, details, validation, ...rest } = data;
+      const { content, message, details, validation, _specialAction, payload, items, results, ...rest } = data;
+      let mdDetails = '';
       if (Object.keys(rest).length > 0) {
-        contentArray.push({ type: 'text', text: JSON.stringify(rest, null, 2) });
-      } else {
-        contentArray.push({ type: 'text', text: 'Operation completed successfully' });
+        mdDetails = '\n\n**详细信息:**\n' + Object.keys(rest).map(k => `- **${k}**: ${rest[k]}`).join('\n');
       }
+      contentArray.push({ type: 'text', text: (data.message || '操作成功完成') + mdDetails });
     }
 
     return {
