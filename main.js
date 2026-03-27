@@ -41,6 +41,7 @@ const forumHandlers = require('./modules/ipc/forumHandlers'); // Import forum ha
 const memoHandlers = require('./modules/ipc/memoHandlers'); // Import memo handlers
 // speechRecognizer is now lazy-loaded
 const canvasHandlers = require('./modules/ipc/canvasHandlers'); // Import canvas handlers
+const { registerDesktopHandlers } = require('./modules/ipc/desktopHandlers'); // Import desktop handlers
 // chokidar is now lazy-loaded
  
  // --- File Watcher ---
@@ -421,6 +422,7 @@ if (!gotTheLock) {
     agentConfigManager.startCleanupTimer(); // Start agent config cleanup
 
     settingsHandlers.initialize({ SETTINGS_FILE, USER_AVATAR_FILE, AGENT_DIR, settingsManager: appSettingsManager, agentConfigManager }); // Initialize settings handlers
+    registerDesktopHandlers(); // Register desktop metrics handlers
 
    // Function to fetch and cache models from the VCP server
    async function fetchAndCacheModels() {

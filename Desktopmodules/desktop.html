@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>VCP Desktop</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #1e1e1e;
+      color: #fff;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    .desktop-widget {
+      background: #2d2d2d;
+      border-radius: 8px;
+      padding: 16px;
+      width: 300px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    }
+    .widget-header {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 12px;
+      border-bottom: 1px solid #444;
+      padding-bottom: 8px;
+    }
+    .metric-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 6px 0;
+    }
+    .metric-label {
+      color: #aaa;
+    }
+    .metric-value {
+      font-weight: 500;
+      color: #4CAF50;
+    }
+    .metric-large {
+      font-size: 32px;
+      font-weight: 700;
+      color: #4CAF50;
+      text-align: center;
+      padding: 12px 0;
+    }
+    .process-item {
+      font-size: 12px;
+      padding: 4px 0;
+      color: #ccc;
+    }
+    .metric-info {
+      color: #888;
+      font-size: 12px;
+      padding: 8px 0;
+    }
+    #desktop-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+    }
+    .automation-demo {
+      background: rgba(255, 255, 255, 0.05);
+      padding: 16px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    .automation-demo button {
+      background: #4CAF50;
+      color: white;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-right: 8px;
+    }
+    .automation-demo button:hover {
+      background: #45a049;
+    }
+  </style>
+</head>
+<body>
+  <div class="automation-demo">
+    <h3>Style Automation Demo</h3>
+    <button onclick="enableAutomation()">Enable CPU-based Background</button>
+    <button onclick="disableAutomation()">Disable</button>
+  </div>
+  <div id="desktop-container"></div>
+
+  <script src="api/desktopMetrics.js"></script>
+  <script src="api/agentMetricsAPI.js"></script>
+  <script src="core/styleAutomation.js"></script>
+  <script src="builtinWidgets/systemMonitorWidget.js"></script>
+  <script src="builtinWidgets/cpuMonitorWidget.js"></script>
+  <script src="builtinWidgets/memoryMonitorWidget.js"></script>
+  <script src="builtinWidgets/diskMonitorWidget.js"></script>
+  <script src="builtinWidgets/batteryMonitorWidget.js"></script>
+  <script src="builtinWidgets/networkMonitorWidget.js"></script>
+  <script src="builtinWidgets/dockerMonitorWidget.js"></script>
+  <script src="builtinWidgets/gpuMonitorWidget.js"></script>
+  <script src="builtinWidgets/processMonitorWidget.js"></script>
+  <script>
+    const container = document.getElementById('desktop-container');
+
+    const widgets = [
+      window.VCPDesktop.builtinWidgets.systemMonitor(),
+      window.VCPDesktop.builtinWidgets.cpuMonitor(),
+      window.VCPDesktop.builtinWidgets.memoryMonitor(),
+      window.VCPDesktop.builtinWidgets.diskMonitor(),
+      window.VCPDesktop.builtinWidgets.batteryMonitor(),
+      window.VCPDesktop.builtinWidgets.networkMonitor(),
+      window.VCPDesktop.builtinWidgets.dockerMonitor(),
+      window.VCPDesktop.builtinWidgets.gpuMonitor(),
+      window.VCPDesktop.builtinWidgets.processMonitor()
+    ];
+
+    widgets.forEach(widget => {
+      container.appendChild(widget);
+      widget.startRefresh();
+    });
+
+    function enableAutomation() {
+      const automation = window.VCPDesktop.styleAutomation;
+      automation.clearRules();
+      automation.addRule('cpu.usage', '--cpu-intensity', 0, 100);
+      automation.enable();
+
+      document.body.style.transition = 'background 1s ease';
+      const style = document.createElement('style');
+      style.textContent = 'body { background: linear-gradient(135deg, #1e1e1e, hsl(calc(120 - var(--cpu-intensity, 0) * 120), 70%, 30%)) !important; }';
+      document.head.appendChild(style);
+    }
+
+    function disableAutomation() {
+      window.VCPDesktop.styleAutomation.disable();
+      document.body.style.background = '#1e1e1e';
+    }
+  </script>
+</body>
+</html>

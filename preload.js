@@ -236,7 +236,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     minimizeToTray: () => ipcRenderer.send('minimize-to-tray'),
     // Splash Screen Close
     closeApp: () => ipcRenderer.send('close-app'),
- 
+
+    // Desktop Metrics
+    desktopMetricsGetSnapshot: (options) => ipcRenderer.invoke('desktop-metrics-get-snapshot', options),
+    desktopMetricsGetCapabilities: () => ipcRenderer.invoke('desktop-metrics-get-capabilities'),
+
      // Image Context Menu
      showImageContextMenu: (imageUrl) => ipcRenderer.send('show-image-context-menu', imageUrl),
     // Open Image in New Window
